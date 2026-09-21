@@ -1,0 +1,63 @@
+#include "aicpu_api.h"
+#include "fa_metadata_args.h"
+#include <cstdint>
+
+namespace {
+inline uint32_t ceil_div(uint32_t a, uint32_t b) { return b ? (a + b - 1) / b : 0; }
+}
+__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+{
+    auto *a = reinterpret_cast<FAMetadataArgs *>(args);
+    const bool mask = a->maskType != 0;
+    auto *t = reinterpret_cast<FAInferTilingData *>(a->metaOutAddr + fa_metadata::TilingOffset(mask));
+    auto *cq = reinterpret_cast<const int32_t *>(a->cuSeqlensQAddr);
+    auto *sk = reinterpret_cast<const int32_t *>(a->seqlensKAddr);
+    auto *bytes = reinterpret_cast<uint8_t *>(t);
+    for (uint64_t i = 0; i < sizeof(*t); ++i) bytes[i] = 0;
+    t->batch = a->batch; t->numHeads = a->numHeads; t->kvHeads = a->numHeadsK;
+    t->embeddingSize = a->embeddingSize; t->embeddingSizeV = a->embeddingSizeV;
+    t->numBlocks = a->numBlocks; t->blockSize = a->pagedKV ? a->blockSize : 128;
+    t->maxNumBlocksPerBatch = a->maxNumBlocksPerBatch; t->maskType = a->maskType;
+    t->scaleValue = a->softmaxScale; t->windowSizeLeft = a->windowSizeLeft;
+    t->windowSizeRight = a->windowSizeRight; t->sparseMode = 0; t->cacheLayout = 0;
+    t->globalWindowSize = 4; t->localWindowSize = 0;
+    t->splitMode = a->numSplits == 0 ? 0 : (a->numSplits == 1 ? 1 : 2);
+    t->requestedNumSplits = a->numSplits;
+    t->qBaseTile = a->embeddingSizeV > 128 ? 64 : 128; t->kvBaseTile = 128;
+    t->qkL1TileM = 128; t->qkL1TileN = 256;
+    t->qkL1TileKLeft = (a->embeddingSize + 15) / 16 * 16; t->qkL1TileKRight = 192;
+    t->pvL1TileM = 128; t->pvL1TileN = (a->embeddingSizeV + 15) / 16 * 16;
+    t->pvL1TileKLeft = 128; t->pvL1TileKRight = 128;
+    t->qL1BufNum = 1; t->kL1BufNum = 2; t->vL1BufNum = 2; t->pL1BufNum = 3;
+    t->qkOutSize = fa_metadata::Mm1OutSize(a->blockDim);
+    t->smOnlineOutSize = fa_metadata::SmOnlineOutSize(a->blockDim);
+    t->pvOutSize = fa_metadata::Mm2OutSize(a->blockDim);
+    t->UpdateSize = fa_metadata::UpdateOutSize(a->blockDim);
+    t->workSpaceSize = fa_metadata::WorkSpaceSize(a->blockDim);
+    uint32_t maxq = 0, maxk = 0, total = 0, first = 0;
+    const uint32_t group = a->numHeadsK ? a->numHeads / a->numHeadsK : 1;
+    for (uint32_t b = 0; b < a->batch; ++b) {
+        uint32_t q = a->isVarlen ? uint32_t(cq[b + 1] - cq[b]) : a->maxQSeqlen;
+        uint32_t k = a->isVarlenKv ? uint32_t(sk[b + 1] - sk[b]) : uint32_t(sk[b]);
+        if (q > maxq) maxq = q; if (k > maxk) maxk = k;
+        uint32_t qn = q ? (128 / q / 2 * 2) : 128;
+        if (a->embeddingSizeV > 128 && q != 0) {
+            uint32_t maxQn = 64 / q;
+            if (maxQn < 1) maxQn = 1;
+            if (qn > maxQn) qn = maxQn;
+        }
+        if (qn < 1) qn = 1;
+        if (qn > group) qn = group;
+        if (qn > 2) qn = qn / 2 * 2;
+        uint32_t tasks = ceil_div(group, qn) * a->numHeadsK * ceil_div(q, t->qBaseTile);
+        if (!b) first = tasks; total += tasks;
+    }
+    t->maxQSeqlen = maxq; t->maxKvSeqlen = maxk; t->firstBatchTaskNum = first; t->totalTaskNum = total;
+    if (mask) {
+        auto *m = reinterpret_cast<int8_t *>(a->metaOutAddr);
+        for (uint32_t r = 0; r < fa_metadata::MASK_DIM; ++r)
+            for (uint32_t c = 0; c < fa_metadata::MASK_DIM; ++c) m[uint64_t(r) * fa_metadata::MASK_DIM + c] = c > r;
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}

@@ -30,8 +30,10 @@
 #include "tiling.cpp"
 #include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
+#include "fa_metadata_args.h"
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
@@ -61,7 +63,8 @@ mha_fwd(at::Tensor q,
         int64_t                   num_splits,
         std::optional<bool>       pack_gqa_,
         std::optional<at::Tensor> learnable_sink_,
-        bool                      return_lse)
+        bool                      return_lse,
+        std::optional<at::Tensor> scheduler_metadata_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -238,90 +241,74 @@ mha_fwd(at::Tensor q,
         out = at::empty(output_sizes, q.options());
     }
 
-    // ============================================================
-    // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
-    //    FAInferContext consumes int64 lists, so we widen on host.
-    // ============================================================
+    // Host tiling needs sequence lengths on CPU. Precomputed metadata keeps
+    // this whole path off graph capture and avoids the D2H synchronization.
     at::Tensor cu_seqlen_q_cpu;
-    if (is_varlen_q) {
-        cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
-    }
-    at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
-
-    int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
-    int64_t max_q_seqlen = 0;
-    int64_t max_kv_seqlen = 0;
-    const int32_t *q_cu_ptr = is_varlen_q ?
-        cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
-    const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
-    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int64_t q_len = is_varlen_q ?
-            static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
-            seqlen_q;
-        const int64_t kv_len = kv_len_ptr[batch_idx];
-        TORCH_CHECK(q_len > 0 && kv_len > 0,
-                    "950 backend (v4) requires positive Q and KV lengths");
-        min_q_seqlen = std::min(min_q_seqlen, q_len);
-        max_q_seqlen = std::max(max_q_seqlen, q_len);
-        max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
-    }
-
-    // 6b. SWA / causal host normalize
-    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-        window_size_left = -1;
-    }
-    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = (window_size_left < 0 && window_size_right == 0);
-    bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = max_kv_seqlen;
-        }
-        if (window_size_right < 0) {
-            window_size_right = max_kv_seqlen;
-        }
-    }
-
-    const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
-        min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
-    // The tiler applies the small-task gate after building the same merged
-    // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
-    // which would over-count GQA/MQA tasks and incorrectly disable FD.
-    const bool flash_decode = num_splits != 1 && fd_shape_supported;
-
-    // ============================================================
-    // 7. Build FAInferContext + run host-side tiling
-    // ============================================================
-    SeqlenScratch scratch;
-    optiling::FAInferContext ctx;
-    fill_inference_context(
-        ctx, scratch,
-        q, k, v,
-        is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
-        &seqlens_k_cpu,
-        paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
-        is_causal,
-        is_local,
-        /* window_size_left= */ is_local ? window_size_left : 0,
-        /* window_size_right= */ is_local ? window_size_right : 0,
-        is_varlen_q, is_bf16,
-        batch_size, seqlen_q, num_heads, num_heads_k,
-        head_size_q, head_size_v,
-        softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        return_lse,
-        is_varlen_q);
-    ctx.flashDecodeFlag = flash_decode;
-    ctx.numSplits = static_cast<uint32_t>(num_splits);
-
+    at::Tensor seqlens_k_cpu;
+    bool is_local = false;
     FAInferTilingData tilingData{};
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "FAInferTilingData must remain a trivially-copyable Device ABI");
-    {
+    if (scheduler_metadata_.has_value()) {
+        const bool has_mask = scheduler_metadata_->nbytes() > sizeof(FAInferTilingData);
+        const int64_t kv_seqlen_bound = max_seqlen_k_.value_or(
+            paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                     : (k.dim() == 4 ? k.size(1) : k.size(0)));
+        if (kv_seqlen_bound > 0 && window_size_left >= kv_seqlen_bound) {
+            window_size_left = -1;
+        }
+        if (kv_seqlen_bound > 0 && window_size_right >= kv_seqlen_bound) {
+            window_size_right = -1;
+        }
+        if (is_causal) {
+            window_size_right = 0;
+        }
+        const bool pure_causal = window_size_left < 0 && window_size_right == 0;
+        is_causal = has_mask && pure_causal;
+        is_local = has_mask && !pure_causal;
+    } else {
+        if (is_varlen_q) {
+            cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
+        }
+        seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
+        int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+        int64_t max_q_seqlen = 0;
+        int64_t max_kv_seqlen = 0;
+        const int32_t *q_cu_ptr = is_varlen_q ? cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
+        const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            const int64_t q_len = is_varlen_q ?
+                static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] : seqlen_q;
+            const int64_t kv_len = kv_len_ptr[batch_idx];
+            TORCH_CHECK(q_len > 0 && kv_len > 0,
+                        "950 backend (v4) requires positive Q and KV lengths");
+            min_q_seqlen = std::min(min_q_seqlen, q_len);
+            max_q_seqlen = std::max(max_q_seqlen, q_len);
+            max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
+        }
+        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) window_size_left = -1;
+        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) window_size_right = -1;
+        if (is_causal) window_size_right = 0;
+        is_causal = window_size_left < 0 && window_size_right == 0;
+        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        if (is_local && window_size_left < 0) window_size_left = max_kv_seqlen;
+        if (is_local && window_size_right < 0) window_size_right = max_kv_seqlen;
+
+        const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
+            min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+        SeqlenScratch scratch;
+        optiling::FAInferContext ctx;
+        fill_inference_context(
+            ctx, scratch, q, k, v,
+            is_varlen_q ? &cu_seqlen_q_cpu : nullptr, &seqlens_k_cpu,
+            paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
+            is_causal, is_local, is_local ? window_size_left : 0,
+            is_local ? window_size_right : 0, is_varlen_q, is_bf16,
+            batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
+            softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
+            return_lse, is_varlen_q);
+        ctx.flashDecodeFlag = num_splits != 1 && fd_shape_supported;
+        ctx.numSplits = static_cast<uint32_t>(num_splits);
         optiling::FAInferTiling tiler(ctx);
         tiler.SetCoreNum(blockDim);
         tiler.DoTiling(tilingData);
@@ -329,7 +316,7 @@ mha_fwd(at::Tensor q,
 
     // The 950 chunk-prefill driver overrides workSpaceSize to 128 MiB
     constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4;  // 128 MiB
-    if (tilingData.workSpaceSize < WS_FLOOR) {
+    if (!scheduler_metadata_.has_value() && tilingData.workSpaceSize < WS_FLOOR) {
         tilingData.workSpaceSize = WS_FLOOR;
     }
 
@@ -337,9 +324,9 @@ mha_fwd(at::Tensor q,
     // 8. Allocate output-side buffers on NPU
     // ============================================================
     auto workspace = at::empty(
-        {static_cast<int64_t>(tilingData.workSpaceSize)},
+        {static_cast<int64_t>(scheduler_metadata_.has_value() ? WS_FLOOR : tilingData.workSpaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
-    const bool flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
+    const bool flashDecodeEnabled = !scheduler_metadata_.has_value() && tilingData.flashDecodeFlag != 0U;
 
     at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (return_lse && is_varlen_q) {
@@ -367,7 +354,15 @@ mha_fwd(at::Tensor q,
         at::device(c10::kCPU).dtype(at::kByte));
     std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData,
                 sizeof(FAInferTilingData));
-    at::Tensor tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
+    at::Tensor tiling_dev = scheduler_metadata_.has_value()
+        ? scheduler_metadata_.value()
+        : tiling_cpu.to(at::Device(at::kPrivateUse1));
+    if (scheduler_metadata_.has_value()) {
+        TORCH_CHECK(tiling_dev.device() == q.device() && tiling_dev.dtype() == at::kByte && tiling_dev.is_contiguous(),
+                    "scheduler_metadata must be a contiguous NPU byte tensor");
+        TORCH_CHECK(tiling_dev.nbytes() == fa_metadata::MetadataBytes(is_causal || is_local),
+                    "scheduler_metadata has incompatible mask/layout size");
+    }
 
     // ============================================================
     // 10. Launch via launch_fwd
@@ -387,7 +382,8 @@ mha_fwd(at::Tensor q,
         ? static_cast<uint8_t*>(softmaxlse.data_ptr())
         : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
-    auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
+    auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr()) +
+        (scheduler_metadata_.has_value() ? fa_metadata::TilingOffset(is_causal || is_local) : 0);
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
     at::Tensor q_seq_i64 = is_varlen_q
@@ -417,10 +413,11 @@ mha_fwd(at::Tensor q,
     auto blockTableDev = paged_KV
         ? static_cast<uint8_t*>(page_table.data_ptr())
         : nullptr;
-    uint8_t* maskDev = nullptr;
+    uint8_t* maskDev = scheduler_metadata_.has_value() && (is_causal || is_local)
+        ? static_cast<uint8_t*>(tiling_dev.data_ptr()) : nullptr;
     at::Tensor mask_npu_tensor;
     at::Tensor mask_cpu_tensor;
-    if (is_causal || is_local) {
+    if ((is_causal || is_local) && !scheduler_metadata_.has_value()) {
         mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -439,12 +436,11 @@ mha_fwd(at::Tensor q,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
         wsDev, tilDev};
-    launch_fwd(fwdArgs);
-
-    const aclError sync_err = aclrtSynchronizeStream(aclStream);
-    TORCH_CHECK(sync_err == ACL_SUCCESS,
-                "950 backend (v4): aclrtSynchronizeStream failed after launch_fwd, err=",
-                sync_err);
+    auto launch_fa_infer = [fwdArgs]() -> int {
+        launch_fwd(fwdArgs);
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     at::Tensor empty_softmax_lse_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));

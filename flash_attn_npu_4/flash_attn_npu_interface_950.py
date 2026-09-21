@@ -27,6 +27,22 @@ def _maybe_contiguous(x):
     """Make sure the inner-most stride is 1; the kernel asserts it."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+
+def get_scheduler_metadata(
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv,
+    headdim, cache_seqlens, qkv_dtype=torch.bfloat16, headdim_v=None,
+    cu_seqlens_q=None, page_size=None, causal=False, window_size=(-1, -1),
+    softcap=0.0, num_splits=0, pack_gqa=None, sm_margin=0, softmax_scale=None,
+):
+    if headdim_v is None:
+        headdim_v = headdim
+    return flash_attn_npu_4_950.get_scheduler_metadata(
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv,
+        headdim, headdim_v, qkv_dtype, _maybe_contiguous(cache_seqlens),
+        cu_seqlens_q, page_size, causal, window_size[0], window_size[1],
+        softcap, num_splits, pack_gqa, sm_margin, softmax_scale,
+    )
+
 @_torch_custom_op_wrapper(
     "flash_attn_npu_4_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
@@ -55,6 +71,7 @@ def _flash_attn_forward(
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k = (_maybe_contiguous(x) for x in (q, k))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -80,6 +97,7 @@ def _flash_attn_forward(
         pack_gqa,
         learnable_sink,
         return_lse,
+        scheduler_metadata,
     )
 
     if out_accum is None:
@@ -119,6 +137,9 @@ def flash_attn_varlen_func(
     aux_tensors=None,
     aux_scalars=None,
     return_lse:bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    disable_scheduler_metadata: bool = False,
+    use_host_tiling: bool = False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -213,33 +234,101 @@ def flash_attn_varlen_func(
 
     if seqused_k is not None and isinstance(seqused_k, int):
         seqused_k = torch.full(
-            (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
+            ((cu_seqlens_q.numel() - 1) if cu_seqlens_q is not None else q.shape[0],),
+            seqused_k, dtype=torch.int32, device=k.device
         )
         seqused_k = _maybe_contiguous(seqused_k)
 
+    batch_size = cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
+    if cu_seqlens_q is not None and page_table is None and max_seqlen_k is None:
+        raise ValueError("max_seqlen_k must be provided for non-paged TND inputs")
+    if seqused_k is None:
+        if cu_seqlens_k is not None:
+            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        else:
+            seqused_k = torch.full(
+                (batch_size,), k.shape[1], dtype=torch.int32, device=k.device
+            )
+        seqused_k = _maybe_contiguous(seqused_k)
+
+    if scheduler_metadata is None and num_splits <= 1 and not disable_scheduler_metadata and not use_host_tiling:
+        num_heads_k = k.shape[1] if k.dim() == 3 else k.shape[2]
+        metadata_max_seqlen_k = max_seqlen_k
+        if metadata_max_seqlen_k is None:
+            metadata_max_seqlen_k = (
+                page_table.shape[1] * k.shape[1]
+                if page_table is not None and k.dim() == 4
+                else (k.shape[1] if k.dim() == 4 else k.shape[0])
+            )
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size, max_seqlen_q or q.shape[0],
+            metadata_max_seqlen_k,
+            q.shape[1] if q.dim() == 3 else q.shape[2], num_heads_k,
+            q.shape[-1], seqused_k, qkv_dtype=q.dtype, headdim_v=v.shape[-1],
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=k.shape[1] if page_table is not None and k.dim() == 4 else None,
+            causal=causal, window_size=window_size, softcap=softcap,
+            num_splits=num_splits, pack_gqa=pack_gqa, softmax_scale=softmax_scale,
+        )
     out, softmax_lse, *rest = _flash_attn_forward(
-        q,
-        k,
-        v,
-        qv,
-        None,  # out_
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_k,
-        seqused_q,
-        seqused_k,
-        gather_kv_indices,
-        page_table,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
-        learnable_sink,
-        softcap,
-        num_splits,
-        pack_gqa,
-        return_lse,
+        q=q,
+        k=k,
+        v=v,
+        qv=qv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_k=min_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        gather_kv_indices=gather_kv_indices,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
     )
-    return (out, softmax_lse, *rest) if return_lse else out
+    return (out, softmax_lse) if return_lse else out
+
+
+def flash_attn_func(
+    q, k, v, qv=None, softmax_scale=None, causal=False,
+    window_size=(-1, -1), softcap=0.0, num_splits=0, pack_gqa=None,
+    return_lse=False, scheduler_metadata=None, disable_scheduler_metadata=False,
+    use_host_tiling=False, **kwargs,
+):
+    if scheduler_metadata is None and num_splits <= 1 and not disable_scheduler_metadata and not use_host_tiling:
+        lengths = torch.full((q.shape[0],), k.shape[1], dtype=torch.int32, device=q.device)
+        scheduler_metadata = get_scheduler_metadata(
+            q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2], q.shape[3],
+            lengths, qkv_dtype=q.dtype, headdim_v=v.shape[-1], causal=causal,
+            window_size=window_size, softcap=softcap, num_splits=num_splits,
+            pack_gqa=pack_gqa, softmax_scale=softmax_scale,
+        )
+    lengths = torch.full((q.shape[0],), k.shape[1], dtype=torch.int32, device=q.device)
+    out, lse, *rest = _flash_attn_forward(
+        q=q,
+        k=k,
+        v=v,
+        qv=qv,
+        max_seqlen_q=q.shape[1],
+        max_seqlen_k=k.shape[1],
+        seqused_k=lengths,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+    )
+    return (out, lse) if return_lse else out

@@ -17,10 +17,7 @@ from tests.common.test_utils import (
     make_random_tensor,
     make_varlen_seqlens,
 )
-if "Ascend950" in torch_npu.npu.get_device_name():
-    from flash_attn_npu_4 import flash_attn_varlen_func
-else:
-    from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""
@@ -433,7 +430,7 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     # 950 kernel, which requires per-batch KV seqlen (csrc/ascend950/flash_attn_npu_4/mha_fwd.cpp).
     bwd_supported = layout == "TND" and cache_mode == 0 and num_splits <= 1 and "Ascend950" not in name
     cu_seqlens_k_for_api = new_kv_seqlen_list if bwd_supported else None
-    max_seqlen_k_for_api = kv_seqlen if bwd_supported else None
+    max_seqlen_k_for_api = kv_seqlen if layout == "TND" or cache_mode == 1 else None
     cache_seqlens_for_api = None if bwd_supported else kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_varlen_func(
         query,
@@ -586,8 +583,7 @@ def test_flash_attn_func(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
 ):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend950" in name:
-        pytest.skip("flash_attn_func is only available on Ascend910")
+    # Ascend950 provides the same BSND API through its forward-only wrapper.
     query = make_random_tensor(
         (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu", requires_grad=True
     )
@@ -654,6 +650,9 @@ def test_flash_attn_func(
         golden_lse_pt[:, :, fully_masked] = torch.inf
     assert_fa_close(out, golden_out_ref, golden_out_pt, name="out")
     assert_fa_close(softmax_lse, golden_lse_ref, golden_lse_pt, name="softmax_lse")
+
+    if "Ascend950" in name:
+        return
 
     dout = make_random_tensor(out.shape, out.dtype, low=-0.5, high=0.5, device="npu")
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out, (query, key, value), dout)
