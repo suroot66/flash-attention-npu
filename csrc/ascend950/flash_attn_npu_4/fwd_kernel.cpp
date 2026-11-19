@@ -249,8 +249,8 @@ class FAIKernel950 {
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        // Preserve FA4 baseline-freeze/rescale-skip optimization in both normal and FD partial tasks.
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, softcapValue_, 4.0f);
+        // Track the true online maximum to avoid amplifying low-precision P rounding.
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, softcapValue_, 0.0f);
         EpilogueRescaleO epilogueRescaleO(resource, /*enableRescaleSkip=*/true);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
